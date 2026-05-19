@@ -1,174 +1,206 @@
-#include <algorithm>
-#include <arpa/inet.h>
-#include <csignal>
-#include <cstdlib>
-#include <iostream>
-#include <mutex>
-#include <string>
-#include <sys/socket.h>
-#include <thread>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#ifdef __linux__
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#endif // __linux__
+#ifdef WIN32
+#include <ws2tcpip.h>
+#endif // WIN32
+#include <thread>
 #include <vector>
+#include <mutex>
+#include <algorithm>
 
-constexpr int BUF_SIZE = 4096;
-
-std::vector<int> clientSockets;
-std::mutex clientMutex;
+#ifdef WIN32
+void myerror(const char* msg) { fprintf(stderr, "%s %lu\n", msg, GetLastError()); }
+#else
+void myerror(const char* msg) { fprintf(stderr, "%s %s %d\n", msg, strerror(errno), errno); }
+#endif
 
 void usage() {
-    std::cerr << "syntax : echo-server <port> [-e [-b]]\n";
-    std::cerr << "sample : echo-server 1234 -e -b\n";
+	printf("echo-server\n");
+	printf("\n");
+	printf("syntax: echo-server <port> [-e [-b]]\n");
+	printf("  -e : echo\n");
+	printf("  -b : broadcast\n");
+	printf("sample: echo-server 1234 -e -b\n");
 }
 
-bool sendAll(int sock, const char* data, size_t len) {
-    size_t sent = 0;
+struct Param {
+	bool echo{false};
+	bool broadcast{false};
+	uint16_t port{0};
 
-    while (sent < len) {
-        ssize_t res = send(sock, data + sent, len - sent, 0);
-        if (res <= 0) return false;
-        sent += res;
-    }
+	bool parse(int argc, char* argv[]) {
+		for (int i = 1; i < argc;) {
+			if (strcmp(argv[i], "-e") == 0) {
+				echo = true;
+				i++;
+				continue;
+			}
 
-    return true;
-}
+			if (strcmp(argv[i], "-b") == 0) {
+				broadcast = true;
+				i++;
+				continue;
+			}
 
-void registerClient(int sock) {
-    std::lock_guard<std::mutex> lock(clientMutex);
-    clientSockets.push_back(sock);
-}
+			if (i < argc) port = atoi(argv[i++]);
+		}
 
-void unregisterClient(int sock) {
-    std::lock_guard<std::mutex> lock(clientMutex);
+		if (broadcast && !echo) {
+			fprintf(stderr, "-b requires -e\n");
+			return false;
+		}
 
-    clientSockets.erase(
-        std::remove(clientSockets.begin(), clientSockets.end(), sock),
-        clientSockets.end()
-    );
-}
+		return port != 0;
+	}
+} param;
 
-std::vector<int> getClientSnapshot() {
-    std::lock_guard<std::mutex> lock(clientMutex);
-    return clientSockets;
-}
+std::vector<int> clients;
+std::mutex clientsMutex;
 
-void sendToAllClients(const char* data, size_t len) {
-    std::vector<int> targets = getClientSnapshot();
+void recvThread(int sd) {
+	printf("connected\n");
+	fflush(stdout);
 
-    for (int clientSock : targets) {
-        sendAll(clientSock, data, len);
-    }
-}
+	static const int BUFSIZE = 65536;
+	char buf[BUFSIZE];
 
-void serveClient(int clientSock, bool echoMode, bool broadcastMode) {
-    registerClient(clientSock);
+	while (true) {
+		ssize_t res = ::recv(sd, buf, BUFSIZE - 1, 0);
+		if (res == 0 || res == -1) {
+			fprintf(stderr, "recv return %zd", res);
+			myerror(" ");
+			break;
+		}
 
-    std::cout << "connected\n";
-    std::cout.flush();
+		buf[res] = '\0';
+		printf("%s", buf);
+		fflush(stdout);
 
-    char buf[BUF_SIZE];
+		if (param.echo) {
+			if (param.broadcast) {
+				std::vector<int> targets;
 
-    while (true) {
-        ssize_t len = recv(clientSock, buf, sizeof(buf), 0);
-        if (len <= 0) break;
+				{
+					std::lock_guard<std::mutex> lock(clientsMutex);
+					targets = clients;
+				}
 
-        std::cout.write(buf, len);
-        std::cout.flush();
+				for (int cli : targets) {
+					::send(cli, buf, res, 0);
+				}
+			} else {
+				ssize_t sendRes = ::send(sd, buf, res, 0);
+				if (sendRes == 0 || sendRes == -1) {
+					fprintf(stderr, "send return %zd", sendRes);
+					myerror(" ");
+					break;
+				}
+			}
+		}
+	}
 
-        if (echoMode) {
-            if (broadcastMode) {
-                sendToAllClients(buf, len);
-            } else {
-                if (!sendAll(clientSock, buf, len)) break;
-            }
-        }
-    }
+	printf("disconnected\n");
+	fflush(stdout);
 
-    unregisterClient(clientSock);
-    close(clientSock);
+	{
+		std::lock_guard<std::mutex> lock(clientsMutex);
+		clients.erase(std::remove(clients.begin(), clients.end(), sd), clients.end());
+	}
 
-    std::cout << "disconnected\n";
-    std::cout.flush();
+	::close(sd);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2 || argc > 4) {
-        usage();
-        return 1;
-    }
+	if (!param.parse(argc, argv)) {
+		usage();
+		return -1;
+	}
 
-    signal(SIGPIPE, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 
-    int port = std::atoi(argv[1]);
+#ifdef WIN32
+	WSAData wsaData;
+	WSAStartup(0x0202, &wsaData);
+#endif // WIN32
 
-    if (port <= 0 || port > 65535) {
-        usage();
-        return 1;
-    }
+	//
+	// socket
+	//
+	int sd = ::socket(AF_INET, SOCK_STREAM, 0);
+	if (sd == -1) {
+		myerror("socket");
+		return -1;
+	}
 
-    bool echoMode = false;
-    bool broadcastMode = false;
+#ifdef __linux__
+	//
+	// setsockopt
+	//
+	{
+		int optval = 1;
+		int res = ::setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(int));
+		if (res == -1) {
+			myerror("setsockopt");
+			return -1;
+		}
+	}
+#endif // __linux__
 
-    for (int i = 2; i < argc; i++) {
-        std::string option = argv[i];
+	//
+	// bind
+	//
+	{
+		struct sockaddr_in addr;
+		memset(&addr, 0, sizeof(addr));
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		addr.sin_port = htons(param.port);
 
-        if (option == "-e") {
-            echoMode = true;
-        } else if (option == "-b") {
-            broadcastMode = true;
-        } else {
-            usage();
-            return 1;
-        }
-    }
+		ssize_t res = ::bind(sd, (struct sockaddr *)&addr, sizeof(addr));
+		if (res == -1) {
+			myerror("bind");
+			return -1;
+		}
+	}
 
-    if (broadcastMode && !echoMode) {
-        std::cerr << "-b option requires -e option\n";
-        usage();
-        return 1;
-    }
+	//
+	// listen
+	//
+	{
+		int res = ::listen(sd, 5);
+		if (res == -1) {
+			myerror("listen");
+			return -1;
+		}
+	}
 
-    int listenSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenSock == -1) {
-        perror("socket");
-        return 1;
-    }
+	while (true) {
+		struct sockaddr_in addr;
+		socklen_t len = sizeof(addr);
 
-    int optval = 1;
-    if (setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
-        perror("setsockopt");
-        close(listenSock);
-        return 1;
-    }
+		int newsd = ::accept(sd, (struct sockaddr *)&addr, &len);
+		if (newsd == -1) {
+			myerror("accept");
+			break;
+		}
 
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serverAddr.sin_port = htons(port);
+		{
+			std::lock_guard<std::mutex> lock(clientsMutex);
+			clients.push_back(newsd);
+		}
 
-    if (bind(listenSock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == -1) {
-        perror("bind");
-        close(listenSock);
-        return 1;
-    }
+		std::thread t(recvThread, newsd);
+		t.detach();
+	}
 
-    if (listen(listenSock, 5) == -1) {
-        perror("listen");
-        close(listenSock);
-        return 1;
-    }
-
-    while (true) {
-        int clientSock = accept(listenSock, nullptr, nullptr);
-
-        if (clientSock == -1) {
-            perror("accept");
-            continue;
-        }
-
-        std::thread(serveClient, clientSock, echoMode, broadcastMode).detach();
-    }
-
-    close(listenSock);
-
-    return 0;
+	::close(sd);
+	return 0;
 }
