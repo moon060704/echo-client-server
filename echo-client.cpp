@@ -1,108 +1,161 @@
-#include <arpa/inet.h>
-#include <csignal>
-#include <cstdlib>
-#include <iostream>
-#include <string>
-#include <sys/socket.h>
-#include <thread>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#ifdef __linux__
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif // __linux__
+#ifdef WIN32
+#include <ws2tcpip.h>
+#endif // WIN32
+#include <iostream>
+#include <thread>
 
-constexpr int BUF_SIZE = 4096;
+#ifdef WIN32
+void myerror(const char* msg) { fprintf(stderr, "%s %lu\n", msg, GetLastError()); }
+#else
+void myerror(const char* msg) { fprintf(stderr, "%s %s %d\n", msg, strerror(errno), errno); }
+#endif
 
 void usage() {
-    std::cerr << "syntax : echo-client <ip> <port>\n";
-    std::cerr << "sample : echo-client 127.0.0.1 1234\n";
+	printf("echo-client\n");
+	printf("\n");
+	printf("syntax: echo-client <ip> <port>\n");
+	printf("sample: echo-client 127.0.0.1 1234\n");
 }
 
-bool sendAll(int sock, const char* data, size_t len) {
-    size_t sent = 0;
+struct Param {
+	char* ip{nullptr};
+	char* port{nullptr};
 
-    while (sent < len) {
-        ssize_t res = send(sock, data + sent, len - sent, 0);
-        if (res <= 0) return false;
-        sent += res;
-    }
+	bool parse(int argc, char* argv[]) {
+		for (int i = 1; i < argc;) {
+			ip = argv[i++];
+			if (i < argc) port = argv[i++];
+		}
+		return (ip != nullptr) && (port != nullptr);
+	}
+} param;
 
-    return true;
-}
+void recvThread(int sd) {
+	printf("connected\n");
+	fflush(stdout);
 
-void receiveLoop(int sock) {
-    char buf[BUF_SIZE];
+	static const int BUFSIZE = 65536;
+	char buf[BUFSIZE];
 
-    while (true) {
-        ssize_t len = recv(sock, buf, sizeof(buf), 0);
-        if (len <= 0) break;
+	while (true) {
+		ssize_t res = ::recv(sd, buf, BUFSIZE - 1, 0);
+		if (res == 0 || res == -1) {
+			fprintf(stderr, "recv return %zd", res);
+			myerror(" ");
+			break;
+		}
 
-        std::cout.write(buf, len);
-        std::cout.flush();
-    }
-}
+		buf[res] = '\0';
+		printf("%s", buf);
+		fflush(stdout);
+	}
 
-void inputLoop(int sock) {
-    std::string line;
-
-    while (std::getline(std::cin, line)) {
-        line += '\n';
-
-        if (!sendAll(sock, line.data(), line.size())) {
-            perror("send");
-            break;
-        }
-    }
+	printf("disconnected\n");
+	fflush(stdout);
+	::close(sd);
+	exit(0);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        usage();
-        return 1;
-    }
+	if (!param.parse(argc, argv)) {
+		usage();
+		return -1;
+	}
 
-    signal(SIGPIPE, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
 
-    const char* ip = argv[1];
-    int port = std::atoi(argv[2]);
+#ifdef WIN32
+	WSAData wsaData;
+	WSAStartup(0x0202, &wsaData);
+#endif // WIN32
 
-    if (port <= 0 || port > 65535) {
-        usage();
-        return 1;
-    }
+	//
+	// getaddrinfo
+	//
+	struct addrinfo aiInput, *aiOutput, *ai;
+	memset(&aiInput, 0, sizeof(aiInput));
+	aiInput.ai_family = AF_INET;
+	aiInput.ai_socktype = SOCK_STREAM;
+	aiInput.ai_flags = 0;
+	aiInput.ai_protocol = 0;
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1) {
-        perror("socket");
-        return 1;
-    }
+	int res = getaddrinfo(param.ip, param.port, &aiInput, &aiOutput);
+	if (res != 0) {
+#if defined(WIN32) && defined(UNICODE)
+		fprintf(stderr, "getaddrinfo: %S\n", gai_strerror(res));
+#else
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(res));
+#endif
+		return -1;
+	}
 
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(port);
+	//
+	// socket
+	//
+	int sd;
+	for (ai = aiOutput; ai != nullptr; ai = ai->ai_next) {
+		sd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (sd != -1) break;
+	}
 
-    if (inet_pton(AF_INET, ip, &serverAddr.sin_addr) != 1) {
-        perror("inet_pton");
-        close(sock);
-        return 1;
-    }
+	if (ai == nullptr) {
+		fprintf(stderr, "can not find socket for %s\n", param.ip);
+		return -1;
+	}
 
-    if (connect(sock, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == -1) {
-        perror("connect");
-        close(sock);
-        return 1;
-    }
+#ifdef __linux__
+	//
+	// setsockopt
+	//
+	{
+		int optval = 1;
+		int res = ::setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(int));
+		if (res == -1) {
+			myerror("setsockopt");
+			return -1;
+		}
+	}
+#endif // __linux__
 
-    std::cout << "connected\n";
-    std::cout.flush();
+	//
+	// connect
+	//
+	{
+		int res = ::connect(sd, ai->ai_addr, ai->ai_addrlen);
+		if (res == -1) {
+			myerror("connect");
+			return -1;
+		}
+	}
 
-    std::thread receiver(receiveLoop, sock);
+	std::thread t(recvThread, sd);
+	t.detach();
 
-    inputLoop(sock);
+	while (true) {
+		std::string s;
 
-    shutdown(sock, SHUT_WR);
+		if (!std::getline(std::cin, s)) break;
 
-    if (receiver.joinable()) {
-        receiver.join();
-    }
+		s += "\r\n";
 
-    close(sock);
+		ssize_t res = ::send(sd, s.data(), s.size(), 0);
+		if (res == 0 || res == -1) {
+			fprintf(stderr, "send return %zd", res);
+			myerror(" ");
+			break;
+		}
+	}
 
-    return 0;
+	::close(sd);
+	return 0;
 }
